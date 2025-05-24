@@ -1,0 +1,8 @@
+names:
+- Glioma
+- Meningioma
+- No Tumor
+- Pituitary
+path: ./
+train: Train
+val: Val

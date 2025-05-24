@@ -1,0 +1,23 @@
+{
+    "timestamp": "2025-05-24 16:59:00",
+    "images": [
+        {
+            "image_path": "./test/Figure-A-Axial-T1-MRI-with-contrast-shows-no-evidence-of-a-brain-tumor.png",
+            "filename": "Figure-A-Axial-T1-MRI-with-contrast-shows-no-evidence-of-a-brain-tumor.png",
+            "detections": [
+                {
+                    "class": "No Tumor",
+                    "confidence": 0.8539528846740723,
+                    "bbox": {
+                        "x1": 29.524356842041016,
+                        "y1": 25.4726505279541,
+                        "x2": 312.36614990234375,
+                        "y2": 400.6415710449219,
+                        "width": 282.841796875,
+                        "height": 375.1689147949219
+                    }
+                }
+            ]
+        }
+    ]
+}
