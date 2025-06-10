@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1.0"
+		/>
+		<title>Brain Tumor Analysis</title>
+		<style>
+			body {
+				font-family: Arial, sans-serif;
+				max-width: 800px;
+				margin: 0 auto;
+				padding: 20px;
+				background-color: #f5f5f5;
+			}
+			.container {
+				background-color: white;
+				padding: 30px;
+				border-radius: 10px;
+				box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+			}
+			h1 {
+				color: #333;
+				text-align: center;
+				margin-bottom: 30px;
+			}
+			.upload-area {
+				border: 2px dashed #ccc;
+				border-radius: 10px;
+				padding: 40px;
+				text-align: center;
+				margin-bottom: 20px;
+				cursor: pointer;
+				transition: border-color 0.3s;
+			}
+			.upload-area:hover {
+				border-color: #007bff;
+			}
+			.upload-area.dragover {
+				border-color: #007bff;
+				background-color: #f0f8ff;
+			}
+			#fileInput {
+				display: none;
+			}
+			.file-list {
+				margin: 20px 0;
+			}
+			.file-item {
+				padding: 10px;
+				background-color: #f8f9fa;
+				margin: 5px 0;
+				border-radius: 5px;
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+			}
+			.btn {
+				background-color: #007bff;
+				color: white;
+				padding: 12px 30px;
+				border: none;
+				border-radius: 5px;
+				cursor: pointer;
+				font-size: 16px;
+				margin: 10px 5px;
+			}
+			.btn:hover {
+				background-color: #0056b3;
+			}
+			.btn:disabled {
+				background-color: #6c757d;
+				cursor: not-allowed;
+			}
+			.results {
+				margin-top: 30px;
+				padding: 20px;
+				background-color: #f8f9fa;
+				border-radius: 5px;
+			}
+			.loading {
+				text-align: center;
+				padding: 20px;
+			}
+			.spinner {
+				border: 4px solid #f3f3f3;
+				border-top: 4px solid #007bff;
+				border-radius: 50%;
+				width: 40px;
+				height: 40px;
+				animation: spin 1s linear infinite;
+				margin: 0 auto;
+			}
+			@keyframes spin {
+				0% {
+					transform: rotate(0deg);
+				}
+				100% {
+					transform: rotate(360deg);
+				}
+			}
+			.error {
+				color: #dc3545;
+				background-color: #f8d7da;
+				padding: 15px;
+				border-radius: 5px;
+				margin: 20px 0;
+			}
+			.success {
+				color: #155724;
+				background-color: #d4edda;
+				padding: 15px;
+				border-radius: 5px;
+				margin: 20px 0;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="container">
+			<h1>🧠 Brain Tumor Analysis</h1>
+
+			<div
+				class="upload-area"
+				onclick="document.getElementById('fileInput').click()"
+			>
+				<p>📁 Click here or drag and drop brain MRI images</p>
+				<p style="color: #666; font-size: 14px">Supported formats: PNG, JPG, JPEG</p>
+			</div>
+
+			<input
+				type="file"
+				id="fileInput"
+				accept=".png,.jpg,.jpeg"
+				multiple
+			/>
+
+			<div
+				id="fileList"
+				class="file-list"
+			></div>
+
+			<div style="text-align: center">
+				<button
+					class="btn"
+					onclick="analyzeImages()"
+					id="analyzeBtn"
+					disabled
+				>
+					📊 Analyze Images (PDF Report)
+				</button>
+				<button
+					class="btn"
+					onclick="analyzeImagesJSON()"
+					id="analyzeJSONBtn"
+					disabled
+				>
+					📋 Analyze Images (JSON)
+				</button>
+				<button
+					class="btn"
+					onclick="checkHealth()"
+					id="healthBtn"
+				>
+					❤️ Check Server Health
+				</button>
+			</div>
+
+			<div id="results"></div>
+		</div>
+
+		<script>
+			let selectedFiles = [];
+			const API_BASE = 'http://localhost:5000';
+
+			// File input handling
+			document.getElementById('fileInput').addEventListener('change', handleFileSelect);
+
+			// Drag and drop handling
+			const uploadArea = document.querySelector('.upload-area');
+			uploadArea.addEventListener('dragover', handleDragOver);
+			uploadArea.addEventListener('dragleave', handleDragLeave);
+			uploadArea.addEventListener('drop', handleDrop);
+
+			function handleFileSelect(event) {
+				const files = Array.from(event.target.files);
+				addFiles(files);
+			}
+
+			function handleDragOver(event) {
+				event.preventDefault();
+				uploadArea.classList.add('dragover');
+			}
+
+			function handleDragLeave(event) {
+				uploadArea.classList.remove('dragover');
+			}
+
+			function handleDrop(event) {
+				event.preventDefault();
+				uploadArea.classList.remove('dragover');
+				const files = Array.from(event.dataTransfer.files);
+				addFiles(files);
+			}
+
+			function addFiles(files) {
+				const validFiles = files.filter((file) => ['image/png', 'image/jpeg', 'image/jpg'].includes(file.type));
+
+				selectedFiles = [...selectedFiles, ...validFiles];
+				updateFileList();
+				updateButtons();
+			}
+
+			function updateFileList() {
+				const fileList = document.getElementById('fileList');
+				fileList.innerHTML = '';
+
+				selectedFiles.forEach((file, index) => {
+					const fileItem = document.createElement('div');
+					fileItem.className = 'file-item';
+					fileItem.innerHTML = `
+                    <span>📄 ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)</span>
+                    <button onclick="removeFile(${index})" style="background: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer;">Remove</button>
+                `;
+					fileList.appendChild(fileItem);
+				});
+			}
+
+			function removeFile(index) {
+				selectedFiles.splice(index, 1);
+				updateFileList();
+				updateButtons();
+			}
+
+			function updateButtons() {
+				const hasFiles = selectedFiles.length > 0;
+				document.getElementById('analyzeBtn').disabled = !hasFiles;
+				document.getElementById('analyzeJSONBtn').disabled = !hasFiles;
+			}
+
+			function showLoading(message = 'Processing...') {
+				document.getElementById('results').innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>${message}</p>
+                </div>
+            `;
+			}
+
+			function showError(message) {
+				document.getElementById('results').innerHTML = `
+                <div class="error">
+                    <strong>Error:</strong> ${message}
+                </div>
+            `;
+			}
+
+			function showSuccess(message) {
+				document.getElementById('results').innerHTML = `
+                <div class="success">
+                    <strong>Success:</strong> ${message}
+                </div>
+            `;
+			}
+
+			async function checkHealth() {
+				showLoading('Checking server health...');
+
+				try {
+					const response = await fetch(`${API_BASE}/health`);
+					const data = await response.json();
+
+					if (response.ok) {
+						const modelsStatus = data.models_loaded;
+						const statusHTML = `
+                        <div class="success">
+                            <h3>✅ Server is healthy!</h3>
+                            <p><strong>YOLO Model:</strong> ${modelsStatus.yolo ? '✅ Loaded' : '❌ Not loaded'}</p>
+                            <p><strong>LLM Model:</strong> ${modelsStatus.llm ? '✅ Loaded' : '❌ Not loaded'}</p>
+                            <p><strong>Timestamp:</strong> ${data.timestamp}</p>
+                        </div>
+                    `;
+						document.getElementById('results').innerHTML = statusHTML;
+					} else {
+						showError('Server health check failed');
+					}
+				} catch (error) {
+					showError(`Cannot connect to server: ${error.message}`);
+				}
+			}
+
+			async function analyzeImages() {
+				if (selectedFiles.length === 0) {
+					showError('Please select at least one image');
+					return;
+				}
+
+				showLoading('Analyzing images and generating PDF report...');
+
+				const formData = new FormData();
+				selectedFiles.forEach((file) => {
+					formData.append('images', file);
+				});
+
+				try {
+					const response = await fetch(`${API_BASE}/analyze`, {
+						method: 'POST',
+						body: formData,
+					});
+
+					if (response.ok) {
+						const blob = await response.blob();
+						const url = window.URL.createObjectURL(blob);
+						const a = document.createElement('a');
+						a.href = url;
+						a.download = `brain_tumor_analysis_${new Date().getTime()}.pdf`;
+						document.body.appendChild(a);
+						a.click();
+						window.URL.revokeObjectURL(url);
+						document.body.removeChild(a);
+
+						showSuccess('PDF report generated and downloaded successfully!');
+					} else {
+						const errorData = await response.json();
+						showError(errorData.error || 'Analysis failed');
+					}
+				} catch (error) {
+					showError(`Network error: ${error.message}`);
+				}
+			}
+
+			async function analyzeImagesJSON() {
+				if (selectedFiles.length === 0) {
+					showError('Please select at least one image');
+					return;
+				}
+
+				showLoading('Analyzing images...');
+
+				const formData = new FormData();
+				selectedFiles.forEach((file) => {
+					formData.append('images', file);
+				});
+
+				try {
+					const response = await fetch(`${API_BASE}/analyze-json`, {
+						method: 'POST',
+						body: formData,
+					});
+
+					if (response.ok) {
+						const data = await response.json();
+						displayJSONResults(data);
+					} else {
+						const errorData = await response.json();
+						showError(errorData.error || 'Analysis failed');
+					}
+				} catch (error) {
+					showError(`Network error: ${error.message}`);
+				}
+			}
+
+			function displayJSONResults(data) {
+				const { detection_results, medical_report, summary } = data;
+
+				let resultsHTML = `
+                <div class="results">
+                    <h3>📊 Analysis Results</h3>
+                    <p><strong>Total Images:</strong> ${summary.total_images}</p>
+                    <p><strong>Total Detections:</strong> ${summary.total_detections}</p>
+                    <p><strong>Analysis Date:</strong> ${detection_results.timestamp}</p>
+                    
+                    <h4>🔍 Detection Details:</h4>
+            `;
+
+				detection_results.images.forEach((image, i) => {
+					resultsHTML += `
+                    <div style="background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 5px;">
+                        <h5>📄 Image ${i + 1}: ${image.filename}</h5>
+                `;
+
+					if (image.detections.length === 0) {
+						resultsHTML += '<p>No tumors detected</p>';
+					} else {
+						image.detections.forEach((detection, j) => {
+							const width = (detection.bbox.width * 0.5).toFixed(1);
+							const height = (detection.bbox.height * 0.5).toFixed(1);
+							resultsHTML += `
+                            <div style="margin-left: 20px; padding: 10px; background: white; border-radius: 3px; margin: 5px 0;">
+                                <strong>Detection ${j + 1}:</strong> ${detection.class}<br>
+                                <strong>Confidence:</strong> ${(detection.confidence * 100).toFixed(1)}%<br>
+                                <strong>Size:</strong> ${width}mm × ${height}mm
+                            </div>
+                        `;
+						});
+					}
+					resultsHTML += '</div>';
+				});
+
+				resultsHTML += `
+                    <h4>📋 Medical Report:</h4>
+                    <div style="background: white; padding: 15px; border-radius: 5px; white-space: pre-wrap; font-family: monospace; font-size: 14px;">
+                        ${medical_report}
+                    </div>
+                </div>
+            `;
+
+				document.getElementById('results').innerHTML = resultsHTML;
+			} // Initialize with health check
+			window.addEventListener('load', function () {
+				// Try to detect if we're running from file:// protocol
+				if (window.location.protocol === 'file:') {
+					showError(
+						'Please open this page through the Flask server at http://localhost:5000 instead of opening the HTML file directly.'
+					);
+					return;
+				}
+				checkHealth();
+			});
+		</script>
+	</body>
+</html>
