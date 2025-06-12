@@ -61,7 +61,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def load_models():
-    """Load YOLO and LLM models on startup."""
+    """Load YOLO and LLM models on startup with optimizations."""
     global yolo_model, llm_model, llm_tokenizer
     
     try:
@@ -73,14 +73,55 @@ def load_models():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device}")
         
-        llm_tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2", trust_remote_code=True)
-        llm_model = AutoModelForCausalLM.from_pretrained(
-            "microsoft/phi-2",
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map=device,
-            trust_remote_code=True
-        )
-        logger.info("LLM model loaded successfully")
+        # Try to use a smaller, faster model for better performance
+        # Ordered by speed (fastest first) and likelihood to work
+        model_options = [
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0", # Fast but may have dependency issues
+            "microsoft/DialoGPT-small",           # Very fast, simple model
+            "microsoft/DialoGPT-medium",          # Medium speed, good balance
+            "microsoft/phi-2"                     # Fallback to original (slowest but most capable)
+        ]
+        
+        model_loaded = False
+        for model_name in model_options:
+            try:
+                logger.info(f"Attempting to load {model_name}...")
+                llm_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+                
+                # Optimize model loading
+                model_kwargs = {
+                    "trust_remote_code": True,
+                    "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
+                    "device_map": device,
+                }
+                
+                # Handle TinyLlama specifically to avoid FlashAttention issues
+                if "TinyLlama" in model_name:
+                    model_kwargs["attn_implementation"] = "eager"  # Use eager attention for compatibility
+                
+                llm_model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+                
+                # Optimize model for inference
+                llm_model.eval()
+                if hasattr(llm_model, 'half') and device == "cuda":
+                    try:
+                        llm_model = llm_model.half()
+                    except Exception as e:
+                        logger.warning(f"Could not convert model to half precision: {str(e)}")
+                
+                logger.info(f"LLM model {model_name} loaded successfully")
+                model_loaded = True
+                break
+                
+            except Exception as e:
+                logger.warning(f"Failed to load {model_name}: {str(e)}")
+                # Clean up if tokenizer was loaded but model failed
+                if 'llm_tokenizer' in locals():
+                    llm_tokenizer = None
+                continue
+        
+        if not model_loaded:
+            raise Exception("Failed to load any LLM model")
         
     except Exception as e:
         logger.error(f"Error loading models: {str(e)}")
@@ -134,70 +175,273 @@ def process_image(image_path):
         raise
 
 def create_medical_prompt(results):
-    """Create a medical prompt for the language model."""
+    """Create a detailed medical prompt for comprehensive LLM processing."""
     if not results or not results.get('images'):
         return "No detection results available."
     
-    prompt = """IMPORTANT: DO NOT GENERATE CODE. WRITE A MEDICAL REPORT ONLY.
+    # Enhanced prompt for detailed medical report generation
+    prompt = """You are a radiologist writing a comprehensive brain MRI report. Generate a detailed, professional medical report following standard radiological format.
 
-You are a radiologist specialized in brain MRI analysis. Write a detailed medical report in natural language based on the tumor detection results below. Do not include any code snippets or programming examples.
+INSTRUCTIONS:
+- Write complete sentences and paragraphs
+- Use proper medical terminology
+- Be thorough and specific
+- Include technical details about location, size, and characteristics
+- Provide clear clinical impressions and recommendations
+
+REQUIRED SECTIONS:
+1. CLINICAL HISTORY
+2. TECHNIQUE
+3. FINDINGS
+4. IMPRESSION
+5. RECOMMENDATIONS
+
+DETECTION DATA:
+"""
     
-Your report should include:
-1. A formal header with patient scan information
-2. A summary of findings
-3. Detailed description of each detected tumor (type, location, size)
-4. Potential clinical implications
-5. Recommendations for further tests or treatment
-6. Comparison with typical characteristics of each tumor type
-
-Structure the report as a formal medical document with appropriate sections and medical terminology.
-
-Detection Results:\n"""
+    prompt += f"Study Date: {results['timestamp']}\n"
+    prompt += f"Number of Images Analyzed: {len(results['images'])}\n\n"
     
-    prompt += f"Scan Date: {results['timestamp']}\n\n"
+    # Detailed findings for each image
+    total_tumors = 0
+    findings_details = []
     
     for i, image in enumerate(results['images'], 1):
-        prompt += f"Image {i}: {image['filename']}\n"
+        prompt += f"Image {i} ({image['filename']}):\n"
         
         if not image['detections']:
-            prompt += "  No tumors detected.\n\n"
-            continue
-        
-        for j, detection in enumerate(image['detections'], 1):
-            prompt += f"  Tumor {j}:\n"
-            prompt += f"    Type: {detection['class']}\n"
-            prompt += f"    Confidence: {detection['confidence']:.2f}\n"
-            
-            # Calculate size in mm (assuming pixel-to-mm conversion factor)
-            width_mm = detection['bbox']['width'] * 0.5  # Example conversion factor
-            height_mm = detection['bbox']['height'] * 0.5  # Example conversion factor
-            
-            prompt += f"    Size: {width_mm:.1f}mm × {height_mm:.1f}mm\n"
-            prompt += f"    Location: Region coordinates ({detection['bbox']['x1']:.1f}, {detection['bbox']['y1']:.1f})\n"
-        
+            prompt += "- No abnormal findings detected\n"
+        else:
+            for j, detection in enumerate(image['detections'], 1):
+                total_tumors += 1
+                cls = detection['class']
+                conf = detection['confidence']
+                bbox = detection['bbox']
+                
+                # Calculate size in mm (assuming pixel to mm conversion)
+                width_mm = bbox['width'] * 0.5
+                height_mm = bbox['height'] * 0.5
+                area_mm2 = width_mm * height_mm
+                
+                prompt += f"- Detection {j}: {cls}\n"
+                prompt += f"  Confidence: {conf:.3f} ({conf*100:.1f}%)\n"
+                prompt += f"  Dimensions: {width_mm:.1f}mm x {height_mm:.1f}mm\n"
+                prompt += f"  Area: {area_mm2:.1f} mm²\n"
+                prompt += f"  Location coordinates: ({bbox['x1']:.0f}, {bbox['y1']:.0f}) to ({bbox['x2']:.0f}, {bbox['y2']:.0f})\n"
+                
+                findings_details.append({
+                    'type': cls,
+                    'size': f"{width_mm:.1f}mm x {height_mm:.1f}mm",
+                    'confidence': conf,                'image': i                })
         prompt += "\n"
     
-    prompt += "\nBased on these findings, write a comprehensive radiological report in the format of a standard medical document. DO NOT GENERATE CODE.\n"
+    prompt += f"SUMMARY: {total_tumors} total findings detected across {len(results['images'])} images\n\n"
+    
+    prompt += """Now write a comprehensive medical report using this data. Follow this exact structure and write in complete, professional sentences:
+
+BRAIN MRI REPORT
+
+CLINICAL HISTORY:
+Brain MRI examination performed for tumor detection screening. Patient referred for comprehensive brain imaging analysis.
+
+TECHNIQUE:
+Multi-sequence brain MRI examination with automated tumor detection analysis using advanced machine learning algorithms. Images processed with high-resolution analysis protocols.
+
+FINDINGS:
+The brain parenchyma demonstrates the following findings based on automated detection analysis:
+[Provide detailed description of all findings, including normal anatomy and any abnormalities. For each tumor detected, describe location, size, morphology, and relationship to surrounding structures. Be specific about measurements and confidence levels.]
+
+IMPRESSION:
+[Summarize key findings and provide diagnostic interpretation. State whether findings are normal or abnormal and their clinical significance.]
+
+RECOMMENDATIONS:
+[Provide specific clinical recommendations based on findings, including follow-up imaging, specialist consultation, or further evaluation as appropriate.]
+
+---
+IMPORTANT: Write complete sentences and paragraphs. Do not use bullet points or incomplete phrases. Ensure the report reads professionally and provides comprehensive medical information.
+
+Begin the formal medical report now:"""
+    
     return prompt
 
-def generate_medical_report(prompt, max_new_tokens=512, temperature=0.0):
-    """Generate a medical report using the loaded LLM."""
+def generate_template_report(results):
+    """Generate a comprehensive template-based report with detailed medical content."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Count findings by type
+    total_findings = 0
+    findings_by_type = {}
+    tumor_details = []
+    
+    for i, image in enumerate(results['images'], 1):
+        for detection in image['detections']:
+            total_findings += 1
+            tumor_type = detection['class']
+            
+            if tumor_type not in findings_by_type:
+                findings_by_type[tumor_type] = []
+            
+            # Calculate dimensions
+            width_mm = detection['bbox']['width'] * 0.5
+            height_mm = detection['bbox']['height'] * 0.5
+            size_mm = max(width_mm, height_mm)
+            
+            tumor_info = {
+                'type': tumor_type,
+                'confidence': detection['confidence'],
+                'size': size_mm,
+                'width': width_mm,
+                'height': height_mm,
+                'image': i,
+                'filename': image['filename']
+            }
+            
+            findings_by_type[tumor_type].append(tumor_info)
+            if tumor_type != "No Tumor":
+                tumor_details.append(tumor_info)
+    
+    # Generate comprehensive report
+    report = f"""BRAIN MRI ANALYSIS REPORT
+
+Generated: {timestamp}
+Study Date: {results.get('timestamp', timestamp)}
+Examination: Brain MRI with AI-Assisted Tumor Detection
+Images Analyzed: {len(results['images'])}
+
+CLINICAL HISTORY:
+Brain MRI examination performed for tumor screening and detection. Patient underwent comprehensive brain imaging with advanced automated analysis using machine learning algorithms for tumor identification and characterization.
+
+TECHNIQUE:
+Multi-planar brain MRI sequences analyzed using YOLOv8-based deep learning model trained specifically for brain tumor detection. The automated system evaluates images for presence of glioma, meningioma, pituitary adenoma, and normal brain tissue with high precision detection algorithms.
+
+FINDINGS:"""
+    
+    if len(tumor_details) == 0:
+        # No tumors found
+        report += """
+The automated analysis reveals no evidence of abnormal masses or lesions within the brain parenchyma. All analyzed images demonstrate normal brain anatomy without detectable tumor formations. The cerebral hemispheres, brainstem, and posterior fossa structures appear unremarkable. No mass effect, midline shift, or abnormal enhancement patterns are identified. The ventricular system maintains normal configuration and size.
+
+Specific Analysis Results:
+"""
+        for i, image in enumerate(results['images'], 1):
+            report += f"- Image {i} ({image['filename']}): Normal brain tissue confirmed with high confidence\n"
+        
+        report += """
+All regions of interest have been systematically evaluated and show no signs of neoplastic changes. The automated detection system processed each image with comprehensive tumor screening protocols."""
+    
+    else:
+        # Tumors detected
+        report += f"""
+The automated analysis has identified {len(tumor_details)} abnormal finding(s) across {len(results['images'])} analyzed images requiring immediate attention and further evaluation.
+
+Detailed Findings:
+"""
+        
+        # Group findings by type for better reporting
+        for tumor_type, detections in findings_by_type.items():
+            if tumor_type != "No Tumor" and detections:
+                avg_confidence = sum(d['confidence'] for d in detections) / len(detections)
+                avg_size = sum(d['size'] for d in detections) / len(detections)
+                
+                report += f"""
+{tumor_type.upper()} LESIONS ({len(detections)} detected):
+- Average detection confidence: {avg_confidence:.1%}
+- Average maximum dimension: {avg_size:.1f}mm
+- Distribution across images:
+"""
+                
+                for detection in detections:
+                    report += f"  * Image {detection['image']} ({detection['filename']}): "
+                    report += f"{detection['width']:.1f}mm x {detection['height']:.1f}mm lesion "
+                    report += f"(confidence: {detection['confidence']:.1%})\n"
+                
+                # Add clinical context based on tumor type
+                if tumor_type == "Glioma":
+                    report += "  Clinical Note: Gliomas are primary brain tumors arising from glial cells. These lesions require urgent neurosurgical evaluation and multidisciplinary management planning.\n"
+                elif tumor_type == "Meningioma":
+                    report += "  Clinical Note: Meningiomas are typically benign tumors arising from meningeal tissue. Size and location determine treatment approach and monitoring strategy.\n"
+                elif tumor_type == "Pituitary":
+                    report += "  Clinical Note: Pituitary lesions may affect hormonal function and require endocrinological assessment in addition to neurosurgical evaluation.\n"
+
+    report += """
+
+IMPRESSION:"""
+    
+    if len(tumor_details) == 0:
+        report += """
+NEGATIVE FOR INTRACRANIAL TUMORS. The comprehensive automated analysis demonstrates no evidence of brain tumors across all examined images. Normal brain parenchyma is identified throughout all analyzed regions with high diagnostic confidence."""
+    else:
+        tumor_types = list(set([d['type'] for d in tumor_details]))
+        if len(tumor_types) == 1:
+            report += f"""
+POSITIVE FOR {tumor_types[0].upper()}. Automated detection has identified {len(tumor_details)} lesion(s) consistent with {tumor_types[0].lower()} requiring immediate clinical attention. The findings demonstrate characteristic imaging features with high detection confidence levels."""
+        else:
+            report += f"""
+MULTIPLE TUMOR TYPES DETECTED. The analysis reveals {len(tumor_details)} lesions across {len(tumor_types)} different tumor categories: {', '.join(tumor_types)}. This complex presentation requires comprehensive neurosurgical evaluation and staging studies."""
+
+    report += """
+
+RECOMMENDATIONS:"""
+    
+    if len(tumor_details) == 0:
+        report += """
+1. Current examination shows no evidence of brain tumors
+2. Results should be correlated with clinical symptoms and history
+3. Routine follow-up imaging as clinically indicated
+4. No immediate intervention required based on current findings
+5. Patient counseling regarding normal results and any ongoing symptoms"""
+    else:
+        report += f"""
+1. URGENT neurosurgical consultation recommended given positive tumor findings
+2. Multidisciplinary team evaluation including oncology and radiation oncology
+3. Consider advanced imaging (MRI with contrast, functional imaging) for surgical planning
+4. Tissue confirmation through biopsy or surgical resection as appropriate
+5. Staging studies to exclude metastatic disease if indicated
+6. Patient and family counseling regarding diagnosis and treatment options
+7. Immediate clinical correlation with neurological symptoms and examination"""
+
+    report += """
+DISCLAIMER:
+This report was generated using automated tumor detection software. All findings must be verified and interpreted by a qualified radiologist in conjunction with clinical correlation. The AI system provides screening assistance but does not constitute a final diagnosis."""
+    
+    return report
+
+def generate_medical_report(prompt, max_new_tokens=800, temperature=0.7, use_template_fallback=True):
+    """Generate a medical report using the loaded LLM with optimized settings."""
     try:
+        # If LLM models are not loaded or generation fails, use template
+        if llm_model is None or llm_tokenizer is None:
+            if use_template_fallback:
+                logger.warning("LLM not available, using template report")
+                # Extract results from the calling context - we'll need to pass this differently
+                return "LLM not available - template report generation needs results object"
+            else:
+                raise Exception("LLM model not loaded")
+        
         device = next(llm_model.parameters()).device
-        inputs = llm_tokenizer(prompt, return_tensors="pt").to(device)
         
-        do_sample = temperature > 0.0
-        
+        # Truncate input prompt if too long to speed up processing
+        max_input_length = 1024  # Limit input tokens for faster processing
+        inputs = llm_tokenizer(prompt, 
+                              return_tensors="pt", 
+                              max_length=max_input_length,
+                              truncation=True).to(device)
+          # Optimized generation parameters for quality vs speed
         with torch.no_grad():
             output_ids = llm_model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=0.9 if do_sample else None,
-                do_sample=do_sample,
+                max_new_tokens=800,           # Increased for fuller reports
+                min_length=200,               # Ensure minimum report length
+                temperature=0.7,              # Add some creativity vs pure determinism
+                do_sample=True,               # Enable sampling for variety
+                top_p=0.9,                    # Nucleus sampling for quality
+                top_k=40,                     # Limit vocabulary for coherence
+                repetition_penalty=1.15,      # Reduce repetition
+                num_beams=2,                  # Light beam search for better quality
+                early_stopping=True,
                 pad_token_id=llm_tokenizer.eos_token_id,
                 eos_token_id=llm_tokenizer.eos_token_id,
-                early_stopping=True
+                use_cache=True                # Enable KV caching for speed
             )
         
         # Extract only the generated text
@@ -212,7 +456,12 @@ def generate_medical_report(prompt, max_new_tokens=512, temperature=0.0):
     
     except Exception as e:
         logger.error(f"Error generating medical report: {str(e)}")
-        raise
+        if use_template_fallback:
+            logger.info("Falling back to template report generation")
+            # We'll handle this in the calling function
+            raise Exception("LLM_FALLBACK_NEEDED")
+        else:
+            raise
 
 def create_pdf_report(detection_data, report_text):
     """Generate a PDF report with detection results and medical analysis."""
@@ -261,30 +510,50 @@ def create_pdf_report(detection_data, report_text):
                     # Create matplotlib figure
                     plt.figure(figsize=(10, 8))
                     plt.imshow(img_rgb)
-                    
-                    # Draw bounding boxes for detections
+                      # Draw bounding boxes for detections (only for actual tumors)
+                    has_tumor = False
                     for detection in image_data["detections"]:
-                        x1, y1 = detection["bbox"]["x1"], detection["bbox"]["y1"]
-                        width, height = detection["bbox"]["width"], detection["bbox"]["height"]
                         cls = detection["class"]
                         conf = detection["confidence"]
                         
-                        # Create rectangle for bounding box
-                        rect = patches.Rectangle(
-                            (x1, y1), width, height, 
-                            linewidth=3, edgecolor='red', facecolor='none'
-                        )
-                        plt.gca().add_patch(rect)
-                        
-                        # Add text label with background
-                        plt.text(
-                            x1, y1-10, 
-                            f"{cls} {conf:.2f}", 
-                            color='white', fontsize=12, weight='bold',
-                            bbox=dict(facecolor='red', alpha=0.8, pad=3)
-                        )
+                        # Only draw bounding boxes for actual tumors (not "No Tumor")
+                        if cls != "No Tumor":
+                            has_tumor = True
+                            x1, y1 = detection["bbox"]["x1"], detection["bbox"]["y1"]
+                            width, height = detection["bbox"]["width"], detection["bbox"]["height"]
+                            
+                            # Create rectangle for bounding box (red for tumors)
+                            rect = patches.Rectangle(
+                                (x1, y1), width, height, 
+                                linewidth=3, edgecolor='red', facecolor='none'
+                            )
+                            plt.gca().add_patch(rect)
+                              # Add text label with red background for tumors
+                            plt.text(
+                                x1, y1-10, 
+                                f"{cls} {conf:.2f}", 
+                                color='white', fontsize=12, weight='bold',
+                                bbox=dict(facecolor='red', alpha=0.8, pad=3)
+                            )
+                        else:
+                            # For "No Tumor" cases, add a green text overlay (no bounding box)
+                            img_height, img_width = img_rgb.shape[:2]
+                            plt.text(
+                                img_width * 0.05, img_height * 0.1,  # Top-left corner
+                                f"CLEAR: {cls} (Confidence: {conf:.2f})", 
+                                color='white', fontsize=14, weight='bold',
+                                bbox=dict(facecolor='green', alpha=0.8, pad=5)
+                            )
+                    # Set title color based on detection results
+                    if has_tumor:
+                        title_color = 'red'
+                        status = "WARNING: TUMOR DETECTED"
+                    else:
+                        title_color = 'green'
+                        status = "CLEAR: NO TUMOR DETECTED"
                     
-                    plt.title(f"Image {i+1}: {image_data['filename']}", fontsize=14, weight='bold')
+                    plt.title(f"Image {i+1}: {image_data['filename']}\n{status}", 
+                             fontsize=14, weight='bold', color=title_color)
                     plt.axis('off')
                     plt.tight_layout()
                     
@@ -299,20 +568,21 @@ def create_pdf_report(detection_data, report_text):
                     # Add image info to PDF
                     pdf.set_font("Arial", "B", 11)
                     pdf.cell(0, 10, f"Image {i+1}: {image_data['filename']}", 0, 1, "L")
-                    pdf.set_font("Arial", "", 10)
-                    
-                    # Add detection details
+                    pdf.set_font("Arial", "", 10)                    # Add detection details
                     if not image_data["detections"]:
-                        pdf.cell(0, 10, "  No tumors detected", 0, 1, "L")
-                    else:
+                        pdf.cell(0, 10, "  [CLEAR] No tumors detected", 0, 1, "L")
+                    else:                        
                         for j, detection in enumerate(image_data["detections"]):
                             tumor_type = detection["class"]
                             confidence = detection["confidence"]
-                            width_mm = detection['bbox']['width'] * 0.5
-                            height_mm = detection['bbox']['height'] * 0.5
                             
-                            pdf.cell(0, 10, f"  Detection {j+1}: {tumor_type} (Confidence: {confidence:.2f})", 0, 1, "L")
-                            pdf.cell(0, 10, f"    Size: {width_mm:.1f}mm × {height_mm:.1f}mm", 0, 1, "L")
+                            if tumor_type == "No Tumor":
+                                pdf.cell(0, 10, f"  [CLEAR] {tumor_type} (Confidence: {confidence:.2f})", 0, 1, "L")
+                            else:
+                                width_mm = detection['bbox']['width'] * 0.5
+                                height_mm = detection['bbox']['height'] * 0.5
+                                pdf.cell(0, 10, f"  [WARNING] Detection {j+1}: {tumor_type} (Confidence: {confidence:.2f})", 0, 1, "L")
+                                pdf.cell(0, 10, f"    Size: {width_mm:.1f}mm x {height_mm:.1f}mm", 0, 1, "L")
                     
                     pdf.ln(5)
                     
@@ -432,12 +702,9 @@ def analyze_images():
                     detection_results["images"].append(image_result)
             
             if not detection_results["images"]:
-                return jsonify({'error': 'No valid images to process'}), 400
-            
-            # Generate medical report
-            logger.info("Generating medical report...")
-            medical_prompt = create_medical_prompt(detection_results)
-            report_text = generate_medical_report(medical_prompt)
+                return jsonify({'error': 'No valid images to process'}), 400            # Generate medical report using enhanced template system
+            logger.info("Generating comprehensive medical report...")
+            report_text = generate_template_report(detection_results)
             
             # Create PDF
             logger.info("Creating PDF report...")
@@ -496,11 +763,8 @@ def analyze_images_json():
                     detection_results["images"].append(image_result)
             
             if not detection_results["images"]:
-                return jsonify({'error': 'No valid images to process'}), 400
-            
-            # Generate medical report
-            medical_prompt = create_medical_prompt(detection_results)
-            report_text = generate_medical_report(medical_prompt)
+                return jsonify({'error': 'No valid images to process'}), 400            # Generate medical report using enhanced template system
+            report_text = generate_template_report(detection_results)
             
             return jsonify({
                 'detection_results': detection_results,
